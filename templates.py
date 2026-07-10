@@ -225,10 +225,14 @@ def co_located_variants_sentence(v: VariantRecord) -> str | None:
     IMPORTANT: this REPLACES clinvar_other_labs_sentence's Case 3 output
     when co-located variants are found (see that function's own gate) --
     it folds the query variant's own classification in here instead of
-    stating it twice. Only the co-located variants' own protein changes
-    and ClinVar IDs appear in the parenthetical lists; the query
-    variant's own protein change/ID are not repeated here, since they're
-    already the blurb's subject.
+    stating it twice. The ClinVar ID list includes the query variant's
+    own ID first, followed by each co-located variant's -- e.g. for the
+    MMUT example, "(ClinVar ID: 829883, 553695, and 1880)" where 829883
+    is the query's own record. The protein-change list, by contrast,
+    does NOT repeat the query's own protein change (only the co-located
+    variants' changes appear there), since "This" already refers to it
+    and restating "p.Arg93Ser and Arg93Cys and Arg93His" would be
+    redundant with the blurb's own subject line.
 
     Grammar: "This and another variant" (singular) for exactly one
     co-located variant found; "This and other variants" (plural) for
@@ -270,7 +274,11 @@ def co_located_variants_sentence(v: VariantRecord) -> str | None:
 
     subject = "This and another variant" if len(v.co_located_variants) == 1 else "This and other variants"
 
-    id_list_str = _join_natural([cv.clinvar_id for cv in v.co_located_variants if cv.clinvar_id])
+    # Query's own ClinVar ID first (matching "This" being mentioned
+    # first in the subject), then each co-located variant's ID in order.
+    all_ids = ([v.clinvar.variation_id] if v.clinvar.variation_id else []) + \
+              [cv.clinvar_id for cv in v.co_located_variants if cv.clinvar_id]
+    id_list_str = _join_natural(all_ids)
     id_clause = f" (ClinVar ID: {id_list_str})" if id_list_str else ""
 
     if combined_labels:
