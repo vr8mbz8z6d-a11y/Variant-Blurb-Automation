@@ -134,6 +134,27 @@ def nmd_sentence(v: VariantRecord) -> str | None:
             f"expression.")
 
 
+def _clinvar_own_label(v: VariantRecord) -> str | None:
+    """
+    Determine the query variant's OWN ClinVar-derived classification
+    label, using the aggregate call if present, else a compact label
+    built from distinct per-submission classifications. Extracted as a
+    shared helper so clinvar_other_labs_sentence and
+    co_located_variants_sentence (which folds this same label into a
+    combined statement when co-located variants exist) can't disagree
+    with each other about what the query variant's own label is.
+    """
+    label = (v.clinvar.aggregate_classification or "").strip()
+    if label:
+        return label
+    seen = []
+    for s in v.clinvar.submissions:
+        c = (s.classification or "").strip().capitalize()
+        if c and c not in seen:  # skip blank/whitespace-only entries
+            seen.append(c)
+    return "/ ".join(seen) if seen else None
+
+
 def clinvar_other_labs_sentence(v: VariantRecord) -> str | None:
     
 
@@ -153,71 +174,113 @@ def clinvar_other_labs_sentence(v: VariantRecord) -> str | None:
 
     # CASE 3: Build a label from the aggregate call, or from distinct
     
-    label = (v.clinvar.aggregate_classification or "").strip()
-    if not label:
-        seen = []
-        for s in v.clinvar.submissions:
-            c = (s.classification or "").strip().capitalize()
-            if c and c not in seen:  # skip blank/whitespace-only entries
-                seen.append(c)
-        label = "/ ".join(seen)
+    label = _clinvar_own_label(v)
 
-    # Safety net: if nothing usable was found (e.g. every submission's
-    # classification text was blank)
+    # If co-located variants were found, the combined
+    # co_located_variants_sentence takes over stating this variant's own
+    # classification (folded in alongside the co-located ones, e.g.
+    # "This and other variants at the same codon... have been classified
+    # as X/Y..."), so this sentence steps aside to avoid stating the same
+    # classification twice in one blurb.
+    if label and v.co_located_variants:
+        return None
+
     if not label:
         return fallback_sentence
 
     return f"This variant has been classified as {label} by other clinical laboratories{id_str}."
 
 
+def _join_natural(items: list[str]) -> str:
+    """Join strings in natural English list style: 'A' / 'A and B' /
+    'A, B, and C'. Used for both the protein-change list and the
+    ClinVar ID list in co_located_variants_sentence."""
+    items = list(items)
+    if not items:
+        return ""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
 def co_located_variants_sentence(v: VariantRecord) -> str | None:
     """
-    Reports OTHER ClinVar variants affecting the SAME amino acid
-    position as this one, e.g.:
-      "Another variant in the same position, p.Arg5105Gln, has been
-       classified as Conflicting classifications of pathogenicity by
-       other clinical laboratories (ClinVar ID: 69441)."
+    Reports OTHER ClinVar variants affecting the SAME codon as this one,
+    COMBINED with this variant's own classification into one statement,
+    e.g.:
+      "This and other variants at the same codon (p.Arg93Cys and
+       Arg93His) have been classified as Pathogenic/Likely pathogenic
+       by other clinical laboratories (ClinVar ID: 553695 and 1880)."
 
-    Confirmed against a real reference report (wording: "Another variant
-    in the same position, p.Arg5105Gln, has conflicting classifications
-    of pathogenicity by other clinical laboratories (ClinVar ID:
-    69441).") -- one deliberate wording choice worth flagging: this
-    reuses the exact "has been classified as X by other clinical
-    laboratories" phrase already established in
-    clinvar_other_labs_sentence, rather than the reference's slightly
-    more informal "has X" shortcut, since that shortcut only reads
-    naturally for this one classification label ("conflicting
-    classifications...") and wouldn't generalize cleanly to every
-    possible label (e.g. "has Pathogenic" reads oddly; "has been
-    classified as Pathogenic" doesn't).
+    Confirmed against a real, explicit target example (MMUT p.Arg93Ser,
+    query classification Pathogenic; co-located Arg93Cys=Likely
+    pathogenic, Arg93His=Pathogenic) -- deduped, query-first ordering of
+    distinct classifications reproduces "Pathogenic/Likely pathogenic"
+    exactly (query's own "Pathogenic" first, then Cys's "Likely
+    pathogenic" as the next new distinct value; His's "Pathogenic" is
+    already seen, so it isn't repeated).
 
-    Renders ONE sentence per co-located variant found (up to the cap
-    already applied in find_co_located_variants), so multiple co-located
-    variants produce multiple consecutive sentences rather than one
-    long, comma-stacked sentence -- no reference was given for the
-    multiple-variant case, so this is a reasonable default, not a
-    confirmed convention.
+    IMPORTANT: this REPLACES clinvar_other_labs_sentence's Case 3 output
+    when co-located variants are found (see that function's own gate) --
+    it folds the query variant's own classification in here instead of
+    stating it twice. Only the co-located variants' own protein changes
+    and ClinVar IDs appear in the parenthetical lists; the query
+    variant's own protein change/ID are not repeated here, since they're
+    already the blurb's subject.
 
-    Omitted entirely if none were found (the common case) -- this data
-    is populated by find_co_located_variants in clinvar_source.py.
+    Grammar: "This and another variant" (singular) for exactly one
+    co-located variant found; "This and other variants" (plural) for
+    more than one. The verb is always plural ("have"), since "this AND
+    [at least one other]" is always a 2+-item subject either way.
+
+    Falls back to "have also been reported in ClinVar" (no
+    classification claimed) if NEITHER the query nor any co-located
+    variant has a known classification -- never asserts a label that
+    isn't actually known for anyone in the group.
+
+    Omitted entirely if no co-located variants were found (the common
+    case) -- this data is populated by find_co_located_variants in
+    clinvar_source.py.
     """
     if not v.co_located_variants:
         return None
 
-    sentences = []
+    own_label = _clinvar_own_label(v)
+
+    # Distinct classifications across the whole group, query's own
+    # first, then each co-located variant's in the order found --
+    # deduped so an identical label isn't repeated.
+    combined_labels: list[str] = []
+    if own_label:
+        combined_labels.append(own_label)
     for cv in v.co_located_variants:
-        id_str = f" (ClinVar ID: {cv.clinvar_id})" if cv.clinvar_id else ""
-        if cv.classification:
-            sentences.append(
-                f"Another variant in the same position, {cv.protein_change}, has been "
-                f"classified as {cv.classification} by other clinical laboratories{id_str}."
-            )
-        else:
-            sentences.append(
-                f"Another variant in the same position, {cv.protein_change}, is also "
-                f"reported in ClinVar{id_str}."
-            )
-    return " ".join(sentences)
+        if cv.classification and cv.classification not in combined_labels:
+            combined_labels.append(cv.classification)
+
+    # Protein-change list: keep "p." on the first item only, matching
+    # natural English list convention (e.g. "p.Arg93Cys and Arg93His",
+    # not "p.Arg93Cys and p.Arg93His").
+    raw_changes = [cv.protein_change for cv in v.co_located_variants]
+    display_changes = [raw_changes[0]] + [
+        pc[2:] if pc.startswith("p.") else pc for pc in raw_changes[1:]
+    ]
+    protein_list_str = _join_natural(display_changes)
+
+    subject = "This and another variant" if len(v.co_located_variants) == 1 else "This and other variants"
+
+    id_list_str = _join_natural([cv.clinvar_id for cv in v.co_located_variants if cv.clinvar_id])
+    id_clause = f" (ClinVar ID: {id_list_str})" if id_list_str else ""
+
+    if combined_labels:
+        classification_clause = (
+            f"have been classified as {'/'.join(combined_labels)} by other clinical laboratories"
+        )
+    else:
+        classification_clause = "have also been reported in ClinVar"
+
+    return f"{subject} at the same codon ({protein_list_str}) {classification_clause}{id_clause}."
 
 
 MAX_PMIDS_IN_BLURB = 3  # cap PMIDs shown in the blurb (you asked for 2-4)
