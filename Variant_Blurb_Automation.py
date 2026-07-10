@@ -3,7 +3,7 @@ from models import VariantRecord
 from variant_type import classify_variant_type
 from myvariant_source import lookup_revel
 from gnomad_source import lookup_gnomad
-from clinvar_source import lookup_clinvar
+from clinvar_source import lookup_clinvar, find_co_located_variants
 from spliceai_source import lookup_spliceai
 from ensembl_hgvs_source import resolve_coordinates, resolve_coordinates_from_gene, get_splice_site_context
 from nmd_predictor import predict_nmd
@@ -60,6 +60,23 @@ def annotate_variant(chrom: str, pos: int, ref: str, alt: str,
     hgvs=hgvs_c_with_transcript,
     debug=debug,
 )
+
+    # Co-located variants: OTHER ClinVar entries at the SAME amino acid
+    # position as this one (e.g. query is p.Asn1355Lysfs*10, this finds
+    # a separately-reported p.Asn1355Lys at the same residue) -- see
+    # find_co_located_variants's docstring for the confirmed reference
+    # example this reproduces. Needs both a transcript accession and a
+    # protein-level hgvs_p to extract a search position from; silently
+    # produces an empty list (no sentence rendered) if either is missing,
+    # e.g. for a splice variant with no p. notation at all.
+    transcript_for_colocated = resolved_transcript or (hgvs_c_with_transcript.split(":")[0]
+                                                        if hgvs_c_with_transcript else None)
+    if transcript_for_colocated and hgvs_p:
+        record.co_located_variants = find_co_located_variants(
+            transcript_for_colocated, hgvs_p,
+            exclude_variation_id=record.clinvar.variation_id,
+            debug=debug,
+        )
 
     # SpliceAI
     # splice site variant.
