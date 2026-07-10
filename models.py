@@ -87,6 +87,20 @@ class NMDPrediction(BaseModel):
     distance_to_last_junction: Optional[int] = None  # nt; None if PTC is in the last exon (not applicable)
 
 
+class CoLocatedVariant(BaseModel):
+    """
+    A DIFFERENT variant affecting the same amino acid position as the
+    variant being reported (e.g. query is p.Asn1355Lysfs*10; this
+    represents a separately-reported p.Asn1355Lys at the same residue).
+    Confirmed against your own reference blurb: "Another variant in the
+    same position, p.Arg5105Gln, has conflicting classifications of
+    pathogenicity by other clinical laboratories (ClinVar ID: 69441)."
+    """
+    protein_change: str          # e.g. "p.Asn1355Lys"
+    classification: Optional[str] = None
+    clinvar_id: Optional[str] = None
+
+
 class FunctionalStudyFlag(BaseModel):
     """
     Deliberately minimal placeholder. Functional-study extraction is being
@@ -121,6 +135,7 @@ class VariantRecord(BaseModel):
     spliceai: SpliceAIData = Field(default_factory=SpliceAIData)
     splice_context: SpliceSiteContext = Field(default_factory=SpliceSiteContext)
     nmd: NMDPrediction = Field(default_factory=NMDPrediction)
+    co_located_variants: List[CoLocatedVariant] = Field(default_factory=list)
     pubmed_ids: List[str] = Field(default_factory=list)
     functional_study: FunctionalStudyFlag = Field(default_factory=FunctionalStudyFlag)
 
