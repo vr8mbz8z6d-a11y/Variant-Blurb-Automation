@@ -29,7 +29,7 @@ import time
 import xml.etree.ElementTree as ET
 import requests
 
-from models import ClinVarData, ClinVarSubmission
+from models import ClinVarData, ClinVarSubmission, CoLocatedVariant
 
 EUTILS_BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils"
 TIMEOUT_SECONDS = 15# NCBI asks for no more than ~3 requests/sec without an API key.
@@ -147,6 +147,147 @@ def find_variation_id_by_hgvs(hgvs: str, debug: bool = False) -> Optional[str]:
               f"{hgvs!r} -- falling back to coordinate-based search instead "
               f"of trusting an unverified text match.")
     return None
+
+
+_REF_AA_POSITION_PATTERN = re.compile(r"p\.\(?([A-Za-z]{3})(\d+)")
+
+
+def _extract_ref_aa_and_position(text: str) -> Optional[tuple[str, int]]:
+    """
+    Extract (reference_amino_acid, position) from any string containing
+    HGVS protein notation -- works on a bare hgvs_p ('p.Asn1355Lysfs*10')
+    or a full ClinVar VariationName containing a trailing parenthetical
+    ('...(p.Asn1355fs)'), since this searches anywhere in the string
+    rather than anchoring to the start.
+
+    This works reliably across variant TYPES (missense, nonsense,
+    frameshift all start with the reference amino acid + position, by
+    HGVS definition) because the reference amino acid at a given codon
+    is a fixed, definitional fact of the gene sequence -- any variant
+    affecting that residue is described starting with the same prefix,
+    regardless of what it changes to.
+    """
+    match = _REF_AA_POSITION_PATTERN.search(text or "")
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def find_co_located_variants(
+    transcript: str,
+    hgvs_p: str,
+    exclude_variation_id: Optional[str] = None,
+    max_results: int = 3,
+    debug: bool = False,
+) -> list[CoLocatedVariant]:
+    """
+    Find OTHER ClinVar variants affecting the SAME amino acid position as
+    the one being reported (e.g. query is p.Asn1355Lysfs*10; this finds
+    a separately-reported p.Asn1355Lys at the same residue) -- confirmed
+    against a real reference report: "Another variant in the same
+    position, p.Arg5105Gln, has conflicting classifications of
+    pathogenicity by other clinical laboratories (ClinVar ID: 69441)."
+
+    APPROACH: search ClinVar's text index for {transcript} + the
+    reference-amino-acid+position prefix (e.g. "NM_007294.4 p.Asn1355"),
+    the same free-text search mechanism already confirmed to work (and
+    to require verification -- see find_variation_id_by_hgvs's docstring
+    for the exact live case that proved NCBI's esearch does phrase-level
+    matching, not exact matching). Every candidate is fetched and its
+    OWN position is re-extracted and compared before being trusted --
+    this is NOT an exact-match search (that's the whole point -- we WANT
+    different changes at the same position), but the POSITION NUMBER
+    itself must match exactly, and the transcript must be the same one
+    being reported against.
+
+    SCOPE, stated explicitly: only searches within this exact transcript
+    accession -- deliberately does not attempt to also find records
+    submitted against a different transcript version of the same gene,
+    consistent with this pipeline's "always verify against the exact
+    requested transcript" approach used everywhere else.
+
+    Args:
+        transcript: e.g. "NM_007294.4" -- the transcript being reported against.
+        hgvs_p: the QUERY variant's own protein notation, used to derive
+            the reference-amino-acid+position search term.
+        exclude_variation_id: if the query variant itself has a known
+            ClinVar ID, pass it here so it doesn't get listed as
+            "another" variant (it would otherwise match itself, since
+            its own position obviously matches).
+        max_results: cap on how many co-located variants to return, to
+            avoid an overly long blurb if a position happens to have
+            many reported variants (same capping pattern used for PMIDs
+            elsewhere in this pipeline).
+
+    Returns:
+        A list of CoLocatedVariant, ordered as returned by ClinVar's
+        search (not otherwise sorted/ranked) -- empty if hgvs_p has no
+        parseable position, the search fails, or nothing else was found
+        at that position.
+    """
+    query_ref_aa_pos = _extract_ref_aa_and_position(hgvs_p)
+    if query_ref_aa_pos is None:
+        if debug:
+            print(f"[clinvar_source] could not extract a reference-amino-acid+position "
+                  f"prefix from hgvs_p={hgvs_p!r} -- skipping co-located variant search")
+        return []
+    query_ref_aa, query_position = query_ref_aa_pos
+
+    term = f"{transcript} p.{query_ref_aa}{query_position}"
+    resp = _ncbi_get("esearch.fcgi", {"db": "clinvar", "term": term, "retmode": "json"}, debug=debug)
+    if resp is None:
+        return []
+
+    try:
+        ids = resp.json()["esearchresult"]["idlist"]
+    except (KeyError, ValueError):
+        return []
+
+    if debug:
+        print(f"[clinvar_source] co-located variant search: {term!r}")
+        print(f"[clinvar_source] candidate variation IDs (unverified): {ids}")
+
+    results: list[CoLocatedVariant] = []
+    for candidate_id in ids:
+        if candidate_id == exclude_variation_id:
+            if debug:
+                print(f"[clinvar_source] skipping {candidate_id}: this is the query "
+                      f"variant's own ClinVar record, not 'another' variant")
+            continue
+
+        root = fetch_vcv_xml(candidate_id, debug=debug)
+        if root is None:
+            continue
+        vcv = root.find(".//VariationArchive")
+        variation_name = vcv.get("VariationName") if vcv is not None else None
+        candidate_ref_aa_pos = _extract_ref_aa_and_position(variation_name or "")
+
+        if candidate_ref_aa_pos is None or candidate_ref_aa_pos[1] != query_position:
+            if debug:
+                print(f"[clinvar_source] REJECTED co-located candidate {candidate_id}: "
+                      f"VariationName {variation_name!r} does not confirm position "
+                      f"{query_position} -- likely an unrelated text match")
+            continue
+
+        # Extract just the protein-change portion for display, e.g.
+        # "p.Asn1355Lys" from "...del (p.Asn1355Lys)".
+        protein_match = re.search(r"p\.\(?[A-Za-z0-9*=]+\)?", variation_name)
+        protein_change = protein_match.group(0).strip("()") if protein_match else variation_name
+
+        classified = parse_vcv_xml(root)
+        if debug:
+            print(f"[clinvar_source] confirmed co-located variant {candidate_id}: "
+                  f"{protein_change!r}, classification={classified.aggregate_classification!r}")
+
+        results.append(CoLocatedVariant(
+            protein_change=protein_change,
+            classification=classified.aggregate_classification,
+            clinvar_id=candidate_id,
+        ))
+        if len(results) >= max_results:
+            break
+
+    return results
 
 
 def _ncbi_get(endpoint: str, params: dict, debug: bool = False) -> Optional[requests.Response]:
