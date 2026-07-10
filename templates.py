@@ -170,6 +170,56 @@ def clinvar_other_labs_sentence(v: VariantRecord) -> str | None:
     return f"This variant has been classified as {label} by other clinical laboratories{id_str}."
 
 
+def co_located_variants_sentence(v: VariantRecord) -> str | None:
+    """
+    Reports OTHER ClinVar variants affecting the SAME amino acid
+    position as this one, e.g.:
+      "Another variant in the same position, p.Arg5105Gln, has been
+       classified as Conflicting classifications of pathogenicity by
+       other clinical laboratories (ClinVar ID: 69441)."
+
+    Confirmed against a real reference report (wording: "Another variant
+    in the same position, p.Arg5105Gln, has conflicting classifications
+    of pathogenicity by other clinical laboratories (ClinVar ID:
+    69441).") -- one deliberate wording choice worth flagging: this
+    reuses the exact "has been classified as X by other clinical
+    laboratories" phrase already established in
+    clinvar_other_labs_sentence, rather than the reference's slightly
+    more informal "has X" shortcut, since that shortcut only reads
+    naturally for this one classification label ("conflicting
+    classifications...") and wouldn't generalize cleanly to every
+    possible label (e.g. "has Pathogenic" reads oddly; "has been
+    classified as Pathogenic" doesn't).
+
+    Renders ONE sentence per co-located variant found (up to the cap
+    already applied in find_co_located_variants), so multiple co-located
+    variants produce multiple consecutive sentences rather than one
+    long, comma-stacked sentence -- no reference was given for the
+    multiple-variant case, so this is a reasonable default, not a
+    confirmed convention.
+
+    Omitted entirely if none were found (the common case) -- this data
+    is populated by find_co_located_variants in clinvar_source.py.
+    """
+    if not v.co_located_variants:
+        return None
+
+    sentences = []
+    for cv in v.co_located_variants:
+        id_str = f" (ClinVar ID: {cv.clinvar_id})" if cv.clinvar_id else ""
+        if cv.classification:
+            sentences.append(
+                f"Another variant in the same position, {cv.protein_change}, has been "
+                f"classified as {cv.classification} by other clinical laboratories{id_str}."
+            )
+        else:
+            sentences.append(
+                f"Another variant in the same position, {cv.protein_change}, is also "
+                f"reported in ClinVar{id_str}."
+            )
+    return " ".join(sentences)
+
+
 MAX_PMIDS_IN_BLURB = 3  # cap PMIDs shown in the blurb (you asked for 2-4)
 
 
@@ -310,6 +360,7 @@ SENTENCE_MODULES = [
     nmd_sentence,
     functional_study_sentence,
     clinvar_other_labs_sentence,
+    co_located_variants_sentence,
     closing_summary_sentence,
 ]
 
