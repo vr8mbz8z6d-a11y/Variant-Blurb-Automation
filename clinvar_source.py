@@ -274,13 +274,26 @@ def find_co_located_variants(
         protein_match = re.search(r"p\.\(?[A-Za-z0-9*=]+\)?", variation_name)
         protein_change = protein_match.group(0).strip("()") if protein_match else variation_name
 
+        # CONFIRMED BUG FIX: also extract the c. notation (same pattern
+        # already used in _normalize_hgvs_for_comparison), needed to
+        # disambiguate co-located variants whose protein notation
+        # collapses to an identical string -- most notably synonymous
+        # variants, where c.8379A>C, c.8379A>T, and c.8379A>G all
+        # display as the same "p.Gly2793=" despite being three distinct
+        # variants. Confirmed against a real live case (BRCA2
+        # p.Gly2793Arg's co-located search returning three "p.Gly2793="
+        # entries that were indistinguishable in the rendered sentence).
+        hgvs_c_match = re.search(r"(c\.[^\s(]+)", variation_name)
+        hgvs_c = hgvs_c_match.group(1).rstrip(".,;") if hgvs_c_match else None
+
         classified = parse_vcv_xml(root)
         if debug:
             print(f"[clinvar_source] confirmed co-located variant {candidate_id}: "
-                  f"{protein_change!r}, classification={classified.aggregate_classification!r}")
+                  f"{protein_change!r} ({hgvs_c!r}), classification={classified.aggregate_classification!r}")
 
         results.append(CoLocatedVariant(
             protein_change=protein_change,
+            hgvs_c=hgvs_c,
             classification=classified.aggregate_classification,
             clinvar_id=candidate_id,
         ))
