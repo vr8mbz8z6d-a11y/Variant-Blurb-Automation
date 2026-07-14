@@ -173,11 +173,39 @@ def _extract_ref_aa_and_position(text: str) -> Optional[tuple[str, int]]:
     return match.group(1), int(match.group(2))
 
 
+_BENIGN_ONLY_LABELS = {"benign", "likely benign"}
+
+
+def _is_benign_only(classification: Optional[str]) -> bool:
+    """
+    True if a classification is PURELY within the benign spectrum --
+    "Benign", "Likely benign", or a compound of just those two (e.g.
+    "Benign/Likely benign"). Used to filter co-located variants that
+    aren't usually clinically noteworthy to report alongside a variant
+    being classified.
+
+    A None/empty classification returns False (NOT considered
+    benign-only) -- we don't want to silently drop a co-located variant
+    just because we don't know its status; only a CONFIRMED benign-only
+    call should be filtered out.
+
+    Splits on "/" so compound labels are checked part-by-part (matching
+    how classifications are combined elsewhere in this pipeline, e.g.
+    "Pathogenic/Likely pathogenic") -- a compound like "Uncertain
+    significance/Likely benign" is NOT benign-only (mixed), so it's kept.
+    """
+    if not classification:
+        return False
+    parts = [p.strip().lower() for p in classification.split("/") if p.strip()]
+    return bool(parts) and all(p in _BENIGN_ONLY_LABELS for p in parts)
+
+
 def find_co_located_variants(
     transcript: str,
     hgvs_p: str,
     exclude_variation_id: Optional[str] = None,
     max_results: int = 3,
+    exclude_benign_only: bool = True,
     debug: bool = False,
 ) -> list[CoLocatedVariant]:
     """
@@ -217,7 +245,18 @@ def find_co_located_variants(
         max_results: cap on how many co-located variants to return, to
             avoid an overly long blurb if a position happens to have
             many reported variants (same capping pattern used for PMIDs
-            elsewhere in this pipeline).
+            elsewhere in this pipeline). Applied AFTER the benign filter
+            below, so it caps the clinically-relevant set, not a mix
+            that includes entries about to be discarded anyway.
+        exclude_benign_only: if True (the default), skip any co-located
+            variant whose classification is PURELY within the benign
+            spectrum (Benign, Likely benign, or a compound of just
+            those two, e.g. "Benign/Likely benign") -- these aren't
+            usually clinically noteworthy to report alongside a variant
+            being classified. A variant with NO known classification is
+            NOT excluded by this (we don't want to silently drop a
+            co-located variant just because we don't know its status --
+            only a CONFIRMED benign-only call is filtered out).
 
     Returns:
         A list of CoLocatedVariant, ordered as returned by ClinVar's
@@ -290,6 +329,13 @@ def find_co_located_variants(
         if debug:
             print(f"[clinvar_source] confirmed co-located variant {candidate_id}: "
                   f"{protein_change!r} ({hgvs_c!r}), classification={classified.aggregate_classification!r}")
+
+        if exclude_benign_only and _is_benign_only(classified.aggregate_classification):
+            if debug:
+                print(f"[clinvar_source] EXCLUDED co-located variant {candidate_id}: "
+                      f"classification {classified.aggregate_classification!r} is purely "
+                      f"benign/likely benign -- not reported (exclude_benign_only=True)")
+            continue
 
         results.append(CoLocatedVariant(
             protein_change=protein_change,
