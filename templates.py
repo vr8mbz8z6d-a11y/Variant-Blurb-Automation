@@ -266,27 +266,78 @@ def co_located_variants_sentence(v: VariantRecord) -> str | None:
     # Protein-change list: keep "p." on the first item only, matching
     # natural English list convention (e.g. "p.Arg93Cys and Arg93His",
     # not "p.Arg93Cys and p.Arg93His").
-    raw_changes = [cv.protein_change for cv in v.co_located_variants]
+    #
+    # CONFIRMED BUG FIX: protein notation alone can be genuinely
+    # ambiguous -- most notably for synonymous variants, where
+    # c.8379A>C, c.8379A>T, and c.8379A>G all display as the SAME
+    # "p.Gly2793=" despite being three distinct variants (confirmed
+    # against a real live case, BRCA2 p.Gly2793Arg's co-located search,
+    # which rendered three indistinguishable "Gly2793=" entries). Any
+    # co-located variant whose protein_change string is shared by
+    # another co-located variant IN THIS SAME GROUP falls back to
+    # showing its c. notation instead (e.g. "c.8379A>C" rather than
+    # "Gly2793="), so each entry stays individually identifiable. A
+    # protein_change that's unique within the group is displayed as
+    # before -- this only changes behavior for the genuinely ambiguous
+    # case, not the common case your original examples were built on.
+    protein_change_counts: dict[str, int] = {}
+    for cv in v.co_located_variants:
+        protein_change_counts[cv.protein_change] = protein_change_counts.get(cv.protein_change, 0) + 1
+
+    raw_changes = []
+    for cv in v.co_located_variants:
+        if protein_change_counts[cv.protein_change] > 1 and cv.hgvs_c:
+            raw_changes.append(cv.hgvs_c)  # disambiguate with c. notation
+        else:
+            raw_changes.append(cv.protein_change)
+
     display_changes = [raw_changes[0]] + [
         pc[2:] if pc.startswith("p.") else pc for pc in raw_changes[1:]
     ]
     protein_list_str = _join_natural(display_changes)
 
-    subject = "This and another variant" if len(v.co_located_variants) == 1 else "This and other variants"
+    # CONFIRMED FIX: "This and other variants..." falsely implies the
+    # query variant itself is part of the classified group. When the
+    # query has no own classification to contribute (own_label is None
+    # -- either genuinely absent from ClinVar, or present but with no
+    # submitted interpretations), drop "This and" entirely and start
+    # with just "Other variants"/"Another variant" instead, since only
+    # the CO-LOCATED variants are actually the ones being described as
+    # classified. This also resolves a real contradiction: without this,
+    # the blurb could say "This variant has not been reported in
+    # ClinVar." immediately followed by "This and other variants...
+    # have been classified as X" -- directly conflicting statements
+    # about the same "This".
+    if own_label:
+        subject = "This and another variant" if len(v.co_located_variants) == 1 else "This and other variants"
+    else:
+        subject = "Another variant" if len(v.co_located_variants) == 1 else "Other variants"
+
+    # Subject-verb agreement: only the bare "Another variant" (singular,
+    # no "This and") takes "has" -- every other case ("This and another
+    # variant" = 2 items, "This and other variants" / "Other variants" =
+    # plural) takes "have".
+    verb = "has" if subject == "Another variant" else "have"
 
     # Query's own ClinVar ID first (matching "This" being mentioned
     # first in the subject), then each co-located variant's ID in order.
-    all_ids = ([v.clinvar.variation_id] if v.clinvar.variation_id else []) + \
+    # Gated on own_label (not just presence of a ClinVar record): the
+    # query's own ID is only included when it's actually part of the
+    # "This and..." group being described -- consistent with the
+    # subject-phrasing fix above. If the query is in ClinVar but has no
+    # classification (Case 2-style), its ID would otherwise appear
+    # alongside a sentence that no longer even mentions "This".
+    all_ids = ([v.clinvar.variation_id] if own_label and v.clinvar.variation_id else []) + \
               [cv.clinvar_id for cv in v.co_located_variants if cv.clinvar_id]
     id_list_str = _join_natural(all_ids)
     id_clause = f" (ClinVar ID: {id_list_str})" if id_list_str else ""
 
     if combined_labels:
         classification_clause = (
-            f"have been classified as {'/'.join(combined_labels)} by other clinical laboratories"
+            f"{verb} been classified as {'/'.join(combined_labels)} by other clinical laboratories"
         )
     else:
-        classification_clause = "have also been reported in ClinVar"
+        classification_clause = f"{verb} also been reported in ClinVar"
 
     return f"{subject} at the same codon ({protein_list_str}) {classification_clause}{id_clause}."
 
