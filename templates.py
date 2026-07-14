@@ -3,6 +3,33 @@ import re
 from models import VariantRecord
 
 
+def nonsense_mechanism_sentence(v: VariantRecord) -> str | None:
+    if v.variant_type != "nonsense":
+        return None
+
+    if not v.hgvs_p:
+        return (
+            "This nonsense variant leads to a premature termination codon, "
+            "which is predicted to lead to a truncated or absent protein."
+        )
+
+    # Extract the amino acid position from p.Gln3982*, p.Arg97Ter, etc.
+    match = re.search(r"[A-Za-z]+(\d+)(?:\*|Ter)", v.hgvs_p)
+
+    if match:
+        position = match.group(1)
+        return (
+            f"This nonsense variant leads to a premature termination codon "
+            f"at position {position}, which is predicted to lead to a "
+            f"truncated or absent protein."
+        )
+
+    # Fallback if parsing fails
+    return (
+        "This nonsense variant leads to a premature termination codon, "
+        "which is predicted to lead to a truncated or absent protein."
+    )
+
 def gnomad_sentence(v: VariantRecord) -> str | None:
     g = v.gnomad
     if g.af is None:
@@ -474,6 +501,7 @@ SENTENCE_MODULES = [
     opening_sentence,
     gnomad_sentence,
     revel_sentence,
+    nonsense_mechanism_sentence,
     spliceai_sentence,
     splice_site_consensus_and_tools_sentence,
     splice_context_sentence,
