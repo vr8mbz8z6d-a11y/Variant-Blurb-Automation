@@ -97,6 +97,15 @@ class CoLocatedVariant(BaseModel):
     pathogenicity by other clinical laboratories (ClinVar ID: 69441)."
     """
     protein_change: str          # e.g. "p.Asn1355Lys"
+    hgvs_c: Optional[str] = None  # e.g. "c.8379A>C" -- CONFIRMED BUG FIX: needed
+                                   # to disambiguate co-located variants whose
+                                   # protein notation collapses to an identical
+                                   # string (most notably synonymous variants,
+                                   # where c.8379A>C, c.8379A>T, and c.8379A>G
+                                   # all display as the SAME "p.Gly2793=" even
+                                   # though they're three distinct variants --
+                                   # confirmed against a real live case, BRCA2
+                                   # p.Gly2793Arg's co-located search).
     classification: Optional[str] = None
     clinvar_id: Optional[str] = None
 
