@@ -325,6 +325,186 @@ def _normalize_indel_to_vcf(chrom: str, pos: int, ref: str, alt: str,
     return chrom, anchor_pos, new_ref, new_alt
 
 
+def _fetch_reference_sequence(chrom: str, start: int, end: int,
+                              genome_build: str = "GRCh38",
+                              timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+                              session: Optional["requests.Session"] = None,
+                              debug: bool = False) -> Optional[str]:
+    """
+    Fetch an inclusive, 1-based reference sequence span from Ensembl.
+
+    Same endpoint and JSON shape as _fetch_reference_base (which is just
+    the single-base case of this); split out because left-alignment needs
+    a window of upstream context, not one base, and doing that in one
+    request instead of N requests keeps us well clear of Ensembl's rate
+    limits.
+
+    Returns the uppercased sequence, or None on any failure -- callers
+    are expected to degrade gracefully rather than treat this as fatal,
+    since a failed left-alignment leaves a still-correct (just not
+    canonical) representation in place.
+    """
+    base_url = _base_url_for_build(genome_build)
+    chrom_clean = chrom.replace("chr", "").replace("Chr", "")
+    region = f"{chrom_clean}:{start}..{end}"
+    url = f"{base_url}/sequence/region/human/{region}"
+    params = {"content-type": "application/json"}
+    http = session or requests.Session()
+
+    if debug:
+        print(f"[ensembl_hgvs_source] GET {url} params={params} "
+              f"(fetching upstream context for left-alignment)")
+
+    try:
+        response = _get_with_retries(http, url, params, timeout_seconds, debug=debug)
+    except requests.RequestException as exc:
+        if debug:
+            print(f"[ensembl_hgvs_source] left-alignment context fetch failed: {exc}")
+        return None
+
+    if debug:
+        print(f"[ensembl_hgvs_source] left-alignment context fetch status "
+              f"{response.status_code}")
+
+    if response.status_code != 200:
+        return None
+
+    try:
+        payload = response.json()
+        seq = payload.get("seq") if isinstance(payload, dict) else None
+    except ValueError:
+        return None
+
+    expected_length = end - start + 1
+    if not seq or len(seq) != expected_length:
+        if debug:
+            print(f"[ensembl_hgvs_source] unexpected sequence length for "
+                  f"{region}: got {len(seq) if seq else 0}, expected "
+                  f"{expected_length} -- skipping left-alignment")
+        return None
+
+    return seq.upper()
+
+
+def _left_align_indel(chrom: str, pos: int, ref: str, alt: str,
+                      genome_build: str = "GRCh38",
+                      timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+                      session: Optional["requests.Session"] = None,
+                      debug: bool = False,
+                      context_bases: int = 250) -> tuple[str, int, str, str]:
+    """
+    Shift an anchor-base indel to its leftmost equivalent position, i.e.
+    normalize it the way VCF (and therefore gnomAD, MyVariant.info, and
+    ClinVar's positionVCF field) does.
+
+    CONFIRMED real bug this fixes: MSH6 NM_000179.3:c.3261dup sits inside
+    an 8-base homopolymer C run (ClinVar's CanonicalSPDI for it is
+    NC_000002.12:47803500:CCCCCCCC:CCCCCCCCC). HGVS applies the 3'
+    (rightmost) rule, so Ensembl VEP reports the duplicated base at the
+    far right of the run and _normalize_indel_to_vcf anchors it as
+    2:47803507 C>CC. gnomAD stores the SAME variant left-aligned as
+    2-47803500-A-AC. gnomAD therefore answered "Variant not found" --
+    which the pipeline correctly interprets as a definitive absence
+    rather than a failed lookup, and so rendered the sentence "It was
+    absent from large population studies such as the Genome Aggregation
+    Database (gnomAD)" for a variant gnomAD actually reports with
+    AC=91, AN=1,610,042, AF=5.652e-05. The same mismatch 404'd the
+    MyVariant.info lookup on the identical representation.
+
+    This is not an edge case: it fires for any indel in a homopolymer or
+    tandem repeat, which covers a large share of real frameshift
+    variants -- precisely the class where the population-frequency
+    sentence carries the most weight.
+
+    ALGORITHM (the standard VCF left-normalization, as implemented by
+    bcftools norm and vt normalize): while the alleles' trailing bases
+    agree and neither allele would be emptied, drop the shared trailing
+    base and prepend the reference base immediately 5' of the current
+    position, decrementing the position by one. Repeat to fixpoint.
+
+    SCOPE: only pure insertions/deletions shift -- that is, cases where
+    one allele is a strict prefix of the other (len(ref)==1 XOR
+    len(alt)==1, which is what anchor-base representation always
+    produces for a simple indel). Substitutions, MNVs and complex delins
+    are returned untouched, since shifting them is either meaningless or
+    not well-defined by this algorithm.
+
+    FAILURE MODE IS SOFT BY DESIGN: if the upstream sequence can't be
+    fetched, or the repeat run is longer than `context_bases`, the input
+    is returned unchanged. That representation is still a correct
+    description of the variant -- just possibly not the one a given
+    database indexed it under -- so degrading here is better than
+    aborting the whole annotation. Callers should keep the unshifted form
+    as a fallback lookup ID (see ResolvedCoordinates.
+    alternate_representations).
+    """
+    # Only simple indels in anchor-base form are shiftable.
+    if len(ref) == len(alt):
+        return chrom, pos, ref, alt
+    if len(ref) > 1 and len(alt) > 1:
+        return chrom, pos, ref, alt
+    if not (ref.startswith(alt) or alt.startswith(ref)):
+        return chrom, pos, ref, alt
+    if ref[-1] != alt[-1]:
+        # Already left-aligned: the anchor base differs from the trailing
+        # base, so there's no shared suffix to trim.
+        return chrom, pos, ref, alt
+
+    window_start = max(1, pos - context_bases)
+    if window_start >= pos:
+        return chrom, pos, ref, alt
+
+    # Fetch [window_start, pos-1]: everything strictly 5' of the anchor.
+    upstream = _fetch_reference_sequence(
+        chrom, window_start, pos - 1, genome_build=genome_build,
+        timeout_seconds=timeout_seconds, session=session, debug=debug,
+    )
+    if not upstream:
+        if debug:
+            print(f"[ensembl_hgvs_source] left-alignment skipped for "
+                  f"{chrom}:{pos} {ref}>{alt}: could not fetch upstream "
+                  f"context. Position left as-is (still a valid "
+                  f"representation, but database lookups may miss).")
+        return chrom, pos, ref, alt
+
+    orig_pos, orig_ref, orig_alt = pos, ref, alt
+    exhausted_context = False
+
+    # Invariant: exactly one of ref/alt has length 1 (anchor-base simple
+    # indel), and they share a trailing base. Each iteration drops that
+    # shared trailing base and re-anchors on the reference base one
+    # position 5', which preserves both the invariant and the variant's
+    # meaning. `upstream` is indexed so upstream[pos-1-window_start] is
+    # the reference base at pos-1.
+    while ref[-1] == alt[-1]:
+        offset = pos - 1 - window_start
+        if offset < 0:
+            exhausted_context = True
+            break
+        preceding = upstream[offset]
+        ref = preceding + ref[:-1]
+        alt = preceding + alt[:-1]
+        pos -= 1
+
+    if debug:
+        if exhausted_context:
+            print(f"[ensembl_hgvs_source] left-alignment hit the edge of the "
+                  f"{context_bases}bp context window at {chrom}:{pos} -- the "
+                  f"repeat run is longer than the window. Increase "
+                  f"context_bases if this recurs.")
+        if pos != orig_pos:
+            print(f"[ensembl_hgvs_source] left-aligned indel: "
+                  f"{chrom}:{orig_pos} {orig_ref}>{orig_alt} -> "
+                  f"{chrom}:{pos} {ref}>{alt} "
+                  f"(shifted {orig_pos - pos} base(s) 5'; HGVS 3'-rule "
+                  f"position differs from VCF/gnomAD left-aligned position)")
+        else:
+            print(f"[ensembl_hgvs_source] indel already left-aligned at "
+                  f"{chrom}:{pos} {ref}>{alt}")
+
+    return chrom, pos, ref, alt
+
+
 def resolve_coordinates(
     hgvs_c_with_transcript: str,
     genome_build: str = "GRCh38",
@@ -487,9 +667,33 @@ def resolve_coordinates(
         timeout_seconds=timeout_seconds, session=http, debug=debug,
     )
 
+    # Left-alignment: HGVS uses the 3' (rightmost) rule for indels in
+    # repeats, VCF/gnomAD/MyVariant.info use the leftmost. Without this
+    # step an indel in a homopolymer resolves to a real but non-canonical
+    # position that those databases have never heard of, and a "Variant
+    # not found" gets reported to the user as a genuine population
+    # absence. See _left_align_indel's docstring for the confirmed MSH6
+    # c.3261dup case. No-op for substitutions and for indels already at
+    # their leftmost position.
+    pre_alignment = (chrom, pos, ref, alt)
+    chrom, pos, ref, alt = _left_align_indel(
+        chrom, pos, ref, alt, genome_build=genome_build,
+        timeout_seconds=timeout_seconds, session=http, debug=debug,
+    )
+    # Keep the 3'-shifted form as a fallback lookup ID: it's an equally
+    # valid description, and a database that indexed this variant under
+    # the HGVS-style position (or that we failed to left-align for) can
+    # still be matched on a retry before we declare the variant absent.
+    alternates: tuple[tuple[str, int, str, str], ...] = (
+        (pre_alignment,) if pre_alignment != (chrom, pos, ref, alt) else ()
+    )
+
     if debug:
         print(f"[ensembl_hgvs_source] resolved: {chrom}:{pos} {ref}>{alt} "
               f"(from allele_string {allele_string!r}, strand={strand!r})")
+        if alternates:
+            print(f"[ensembl_hgvs_source] alternate representation kept for "
+                  f"fallback lookups: {alternates}")
 
     return ResolvedCoordinates(
         chrom=chrom,
@@ -501,6 +705,7 @@ def resolve_coordinates(
         hgvs_c=hgvs_c,
         validated_description=result.get("input", hgvs_c_with_transcript),
         strand=int(strand) if strand in (-1, 1, "-1", "1") else None,
+        alternate_representations=alternates,
     )
 
 
