@@ -20,6 +20,12 @@ def annotate_variant(chrom: str, pos: int, ref: str, alt: str,
     
     resolved_transcript: str | None = None
     resolved_strand: int | None = None
+    # Equally-valid alternate VCF representations of the same variant
+    # (populated for indels in repeats/homopolymers, where the HGVS 3'
+    # position and the VCF left-aligned position differ). Passed to
+    # gnomAD so a normalization mismatch can't masquerade as a genuine
+    # population absence.
+    alternate_representations: tuple = ()
 
     if hgvs_c_with_transcript:
         try:
@@ -27,9 +33,13 @@ def annotate_variant(chrom: str, pos: int, ref: str, alt: str,
             chrom, pos, ref, alt = resolved.chrom, resolved.pos, resolved.ref, resolved.alt
             resolved_transcript = resolved.transcript
             resolved_strand = resolved.strand
+            alternate_representations = getattr(resolved, "alternate_representations", ())
             if debug:
                 print(f"[pipeline] resolved {hgvs_c_with_transcript!r} -> "
                       f"{resolved.chrom}:{resolved.pos} {resolved.ref}>{resolved.alt}")
+                if alternate_representations:
+                    print(f"[pipeline] equivalent alternate representation(s) available "
+                          f"for fallback lookups: {alternate_representations}")
         except HGVSResolutionError as e:
             if debug:
                 print(f"[pipeline] HGVS resolution failed, falling back to passed-in "
@@ -44,7 +54,9 @@ def annotate_variant(chrom: str, pos: int, ref: str, alt: str,
     record.variant_type = classify_variant_type(hgvs_p=hgvs_p, hgvs_c=hgvs_c)
 
     # gnomAD 
-    record.gnomad = lookup_gnomad(chrom, pos, ref, alt, genome_build=genome_build, debug=debug)
+    record.gnomad = lookup_gnomad(chrom, pos, ref, alt, genome_build=genome_build,
+                                  debug=debug,
+                                  alternate_representations=alternate_representations)
 
     # REVEL 
     record.revel = lookup_revel(record.myvariant_hgvs_id(), genome_build=genome_build, debug=debug)
