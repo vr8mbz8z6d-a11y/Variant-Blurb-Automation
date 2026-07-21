@@ -139,6 +139,19 @@ class ResolvedCoordinates:
     # kept for audit/debug purposes.
     validated_description: str
     strand: Optional[int] = None
+    # Other equally-valid VCF representations of the SAME variant, as
+    # (chrom, pos, ref, alt) tuples, EXCLUDING the canonical one in the
+    # fields above.
+    #
+    # WHY THIS EXISTS: an indel inside a homopolymer or tandem repeat has
+    # several positionally-different but sequence-identical VCF
+    # representations. HGVS uses the 3' (rightmost) rule; VCF -- and
+    # therefore gnomAD and MyVariant.info -- uses the leftmost. We now
+    # left-align (see ensembl_hgvs_source._left_align_indel) so the
+    # canonical fields hold the leftmost form, but we keep the
+    # pre-alignment form here so a downstream lookup that misses can
+    # retry before declaring a variant "absent" from a database.
+    alternate_representations: tuple[tuple[str, int, str, str], ...] = ()
 
 
 def _parse_transcript_and_hgvs(hgvs_c_with_transcript: str) -> tuple[str, str]:
