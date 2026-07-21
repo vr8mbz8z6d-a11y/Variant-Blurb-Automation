@@ -184,7 +184,8 @@ def parse_combined_gnomad(variant: Optional[dict], confirmed_absent: bool = Fals
 
 
 def lookup_gnomad(chrom: str, pos: int, ref: str, alt: str,
-                   genome_build: str = "hg38", debug: bool = False) -> GnomadData:
+                   genome_build: str = "hg38", debug: bool = False,
+                   alternate_representations: tuple = ()) -> GnomadData:
     """
     Combined gnomAD v4 (GRCh38) allele frequency for a variant, using the
     API's own authoritative `joint` (exome+genome combined) figure.
@@ -193,6 +194,24 @@ def lookup_gnomad(chrom: str, pos: int, ref: str, alt: str,
     back to the v2.1.1 dataset (gnomad_r2_1), which is gnomAD's documented
     GRCh37 dataset -- but note v2 predates the `joint` field and this
     path is not the primary, tested one.
+
+    alternate_representations: optional (chrom, pos, ref, alt) tuples
+    describing the SAME variant at a different but equally valid VCF
+    position -- see ResolvedCoordinates.alternate_representations. If the
+    primary ID isn't found, each is tried before we conclude the variant
+    is genuinely absent.
+
+    WHY THE RETRY EXISTS: "absent from gnomAD" is a strong clinical claim
+    that feeds directly into the rendered blurb, and for indels a
+    not-found result is ambiguous between "genuinely never observed" and
+    "observed, but indexed under a different left/right-shifted
+    representation of the same change". CONFIRMED case: MSH6
+    NM_000179.3:c.3261dup was reported as absent while gnomAD actually
+    holds it (AC=91, AF=5.65e-05) under a left-aligned ID seven bases
+    away. The primary fix for that is left-alignment upstream in
+    ensembl_hgvs_source; this retry is the belt-and-braces second line,
+    so a future normalization gap degrades into an extra API call rather
+    than a false clinical statement.
     """
     dataset = "gnomad_r4"
     if genome_build.lower() in ("hg19", "grch37", "37"):
@@ -201,6 +220,29 @@ def lookup_gnomad(chrom: str, pos: int, ref: str, alt: str,
             print("[gnomad_source] GRCh37 build requested -> using gnomad_r2_1 dataset "
                   "(predates the 'joint' field -- will fall back to manual summing)")
     variant, confirmed_absent = fetch_gnomad_variant(chrom, pos, ref, alt, dataset=dataset, debug=debug)
+
+    if variant is None and alternate_representations:
+        for alt_chrom, alt_pos, alt_ref, alt_alt in alternate_representations:
+            if (alt_chrom, alt_pos, alt_ref, alt_alt) == (chrom, pos, ref, alt):
+                continue
+            if debug:
+                print(f"[gnomad_source] primary ID {_variant_id(chrom, pos, ref, alt)} "
+                      f"not found -- retrying equivalent representation "
+                      f"{_variant_id(alt_chrom, alt_pos, alt_ref, alt_alt)} before "
+                      f"concluding this variant is absent")
+            retry_variant, retry_absent = fetch_gnomad_variant(
+                alt_chrom, alt_pos, alt_ref, alt_alt, dataset=dataset, debug=debug)
+            if retry_variant is not None:
+                if debug:
+                    print(f"[gnomad_source] FOUND under alternate representation "
+                          f"{_variant_id(alt_chrom, alt_pos, alt_ref, alt_alt)} -- the "
+                          f"primary coordinate was a normalization mismatch, NOT a real "
+                          f"absence. Using the alternate's data.")
+                variant, confirmed_absent = retry_variant, False
+                break
+            # Only keep asserting absence if every representation agrees.
+            confirmed_absent = confirmed_absent and retry_absent
+
     if debug and confirmed_absent:
         print("[gnomad_source] gnomAD explicitly reports this variant as absent "
               "(not a lookup failure) -- will render as 'not observed in gnomAD'.")
